@@ -1,114 +1,181 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 public class GridManager : MonoBehaviour
 {
+    // Survives scene reloads so WinEffect can increment it between levels
+    public static int currentLevel = 1;
+
     [Header("Grid Settings")]
-    public int columns = 5;
-    public int rows = 5;
+    public int   columns  = 5;
+    public int   rows     = 5;
     public float cellSize = 1.2f;
 
-    [Header("Prefabs")]
-    public GameObject arrowPrefab;
+    [Header("Visuals")]
+    [Tooltip("Triangle sprite for arrowheads — assign in Inspector")]
+    public Sprite  arrowHeadSprite;
+    public Color[] arrowColors = { Color.red, Color.blue, Color.green, Color.yellow, Color.magenta };
 
-    // Двумерный массив — хранит все стрелки на доске
-    private ArrowCell[,] grid;
+
+    [Header("Collision Feedback")]
+    public Color collisionFlashColor    = Color.red;
+    [Min(0.1f)]
+    public float collisionFlashDuration = 1.0f;
+
+    [Header("Arrow Appearance & Feel")]
+    [Tooltip("How fast arrows slide off the board (units/sec)")]
+    [Min(1f)]
+    public float arrowSpeed         = 12f;
+    [Tooltip("Line thickness as a fraction of cell size (0.1 = thin, 0.5 = fat)")]
+    [Range(0.1f, 0.5f)]
+    public float arrowBodyWidth     = 0.36f;
+    [Tooltip("Arrowhead scale as a fraction of cell size (0.8 = small, 1.4 = big)")]
+    [Range(0.5f, 2.0f)]
+    public float arrowHeadScale     = 1.0f;
+
+    [Header("Glow (requires URP Bloom — see BloomSetup)")]
+    [Tooltip("HDR brightness multiplier. > 1 triggers URP Bloom. 1 = no glow, 3 = strong neon")]
+    [Range(1f, 6f)]
+    public float glowIntensity = 1.5f;
+
+    // Each element is the ArrowCell occupying that cell (multiple cells → same ArrowCell reference)
+    private ArrowCell[,]    grid;
+    private List<ArrowCell> allArrows = new List<ArrowCell>();
+    private int             colorIndex;
+    private WinEffect       winEffect;
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     void Awake()
     {
+        winEffect = GetComponent<WinEffect>() ?? gameObject.AddComponent<WinEffect>();
+        // Auto-add Bloom post-processing if not already in scene
+        if (FindObjectOfType<BloomSetup>() == null)
+            gameObject.AddComponent<BloomSetup>();
         grid = new ArrowCell[columns, rows];
         CenterGrid();
     }
 
-    // Центрирует сетку на экране
     void CenterGrid()
     {
-        float offsetX = (columns - 1) * cellSize / 2f;
-        float offsetY = (rows - 1) * cellSize / 2f;
-        transform.position = new Vector3(-offsetX, -offsetY, 0);
+        float ox = (columns - 1) * cellSize / 2f;
+        float oy = (rows    - 1) * cellSize / 2f;
+        transform.position = new Vector3(-ox, -oy, 0);
     }
 
-    // Возвращает мировую позицию ячейки по координатам сетки
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    // Override grid dimensions at runtime (call before PlaceArrow)
+    public void Reinitialize(int cols, int rows, float cs)
+    {
+        columns    = cols;
+        this.rows  = rows;
+        cellSize   = cs;
+        grid       = new ArrowCell[columns, rows];
+        allArrows.Clear();
+        colorIndex = 0;
+        CenterGrid();
+    }
+
+    // Returns the world-space centre of a grid cell
     public Vector3 GetWorldPosition(int col, int row)
+        => transform.position + new Vector3(col * cellSize, row * cellSize, 0);
+
+    // Spawns a snake arrow; silently returns if any cell is out of bounds or occupied
+    public void PlaceArrow(ArrowData data)
     {
-        return transform.position + new Vector3(col * cellSize, row * cellSize, 0);
+        foreach (var c in data.cells)
+        {
+            if (!InBounds(c.x, c.y))   { Debug.LogWarning($"PlaceArrow: {c} out of bounds");    return; }
+            if (grid[c.x, c.y] != null) { Debug.LogWarning($"PlaceArrow: {c} already occupied"); return; }
+        }
+
+        // Create the snake GameObject; [RequireComponent] on ArrowCell auto-adds LineRenderer
+        var go   = new GameObject($"Arrow_{data.cells[0]}");
+        go.transform.SetParent(transform);
+        var cell = go.AddComponent<ArrowCell>();
+
+        Color color = arrowColors[colorIndex++ % arrowColors.Length];
+        cell.Init(data, this, arrowHeadSprite, color);
+
+        foreach (var c in data.cells)
+            grid[c.x, c.y] = cell;
+
+        allArrows.Add(cell);
     }
 
-    // Размещает стрелку на сетке
-    public void PlaceArrow(int col, int row, ArrowDirection direction)
+    // Called by ArrowCell when it starts its exit animation — frees all of its cells
+    public void ClearArrow(ArrowCell arrow)
     {
-        if (!IsInBounds(col, row)) return;
-        if (grid[col, row] != null) return; // ячейка уже занята
+        foreach (var c in arrow.data.cells)
+            if (InBounds(c.x, c.y) && grid[c.x, c.y] == arrow)
+                grid[c.x, c.y] = null;
 
-        Vector3 pos = GetWorldPosition(col, row);
-        GameObject obj = Instantiate(arrowPrefab, pos, Quaternion.identity, transform);
-        
-        ArrowCell cell = obj.GetComponent<ArrowCell>();
-        cell.Init(col, row, direction, this);
-        grid[col, row] = cell;
-    }
-
-    // Убирает стрелку с сетки (вызывается когда стрелка уходит)
-    public void ClearCell(int col, int row)
-    {
-        if (!IsInBounds(col, row)) return;
-        grid[col, row] = null;
+        allArrows.Remove(arrow);
 
         if (IsGridEmpty())
         {
-            Debug.Log("YOU WIN!");
-            // TODO: показать экран победы
+            if (winEffect != null)
+                winEffect.Show(currentLevel);
+            else
+                Debug.Log($"YOU WIN! Level {currentLevel}");
         }
     }
 
-    // Проверяет — свободен ли путь для стрелки в её направлении
-    public bool IsPathClear(int col, int row, ArrowDirection direction)
+    // Checks every cell ahead of the arrowhead (in exit direction) for blockage
+    public bool IsPathClear(ArrowData data)
     {
-        int checkCol = col;
-        int checkRow = row;
+        Vector2Int last = data.cells[data.cells.Count - 1];
+        Vector2Int step = StepFor(data.exitDirection);
+        int col = last.x + step.x;
+        int row = last.y + step.y;
 
-        while (true)
+        while (InBounds(col, row))
         {
-            // Двигаемся на один шаг в направлении стрелки
-            switch (direction)
-            {
-                case ArrowDirection.Up:    checkRow++; break;
-                case ArrowDirection.Down:  checkRow--; break;
-                case ArrowDirection.Right: checkCol++; break;
-                case ArrowDirection.Left:  checkCol--; break;
-            }
-
-            // Вышли за пределы — путь свободен до края
-            if (!IsInBounds(checkCol, checkRow)) return true;
-
-            // На пути стоит другая стрелка — коллизия
-            if (grid[checkCol, checkRow] != null) return false;
+            if (grid[col, row] != null) return false;
+            col += step.x;
+            row += step.y;
         }
+        return true; // reached grid edge without hitting anything
     }
 
-    // Проверяет все ячейки — если все null, доска пуста
+    // ── Private helpers ───────────────────────────────────────────────────────
+
     bool IsGridEmpty()
     {
-        foreach (var cell in grid)
-            if (cell != null) return false;
+        foreach (var c in grid)
+            if (c != null) return false;
         return true;
     }
 
-    bool IsInBounds(int col, int row)
+    bool InBounds(int col, int row)
+        => col >= 0 && col < columns && row >= 0 && row < rows;
+
+    static Vector2Int StepFor(ArrowDirection dir)
     {
-        return col >= 0 && col < columns && row >= 0 && row < rows;
+        switch (dir)
+        {
+            case ArrowDirection.Up:   return Vector2Int.up;
+            case ArrowDirection.Down: return Vector2Int.down;
+            case ArrowDirection.Left: return Vector2Int.left;
+            default:                  return Vector2Int.right; // Right
+        }
     }
 
-    // Рисует сетку в редакторе для наглядности
+    // ── Editor gizmos ─────────────────────────────────────────────────────────
+
     void OnDrawGizmos()
     {
         Gizmos.color = Color.cyan;
-        float offsetX = (columns - 1) * cellSize / 2f;
-        float offsetY = (rows - 1) * cellSize / 2f;
-        Vector3 origin = transform.position - new Vector3(offsetX, offsetY, 0);
+        float ox = (columns - 1) * cellSize / 2f;
+        float oy = (rows    - 1) * cellSize / 2f;
 
         for (int c = 0; c < columns; c++)
             for (int r = 0; r < rows; r++)
-                Gizmos.DrawWireCube(origin + new Vector3(c * cellSize, r * cellSize, 0),
-                                    Vector3.one * (cellSize - 0.1f));
+            {
+                // Computed independently of transform so it's correct in both edit & play mode
+                Vector3 center = new Vector3(c * cellSize - ox, r * cellSize - oy, 0);
+                Gizmos.DrawWireCube(center, Vector3.one * (cellSize - 0.1f));
+            }
     }
 }
